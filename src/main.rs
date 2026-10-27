@@ -83,43 +83,279 @@ struct Vault {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let cli = Cli::try_parse();
 
-    match cli.command {
-        Commands::Init { password, vault_path } => {
-            if let Err(e) = init_vault(&password, &vault_path) {
-                eprintln!("Error initializing vault: {}", e);
-                std::process::exit(1);
+    match cli {
+        Ok(cli) => {
+            match cli.command {
+                Commands::Init { password, vault_path } => {
+                    if let Err(e) = init_vault(&password, &vault_path) {
+                        eprintln!("Error initializing vault: {}", e);
+                        std::process::exit(1);
+                    }
+                    println!("Vault initialized at {}", vault_path);
+                }
+                Commands::Add { service, username, password, generate, vault_path } => {
+                    if let Err(e) = add_credential(&service, &username, password, generate, &vault_path) {
+                        eprintln!("Error adding credential: {}", e);
+                        std::process::exit(1);
+                    }
+                    println!("Credential added for service: {}", service);
+                }
+                Commands::Get { service, vault_path, copy } => {
+                    if let Err(e) = get_credential(&service, &vault_path, copy) {
+                        eprintln!("Error getting credential: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+                Commands::List { vault_path } => {
+                    if let Err(e) = list_credentials(&vault_path) {
+                        eprintln!("Error listing credentials: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+                Commands::Delete { service, vault_path } => {
+                    if let Err(e) = delete_credential(&service, &vault_path) {
+                        eprintln!("Error deleting credential: {}", e);
+                        std::process::exit(1);
+                    }
+                    println!("Credential deleted for service: {}", service);
+                }
             }
-            println!("Vault initialized at {}", vault_path);
         }
-        Commands::Add { service, username, password, generate, vault_path } => {
-            if let Err(e) = add_credential(&service, &username, password, generate, &vault_path) {
-                eprintln!("Error adding credential: {}", e);
+        Err(_) => {
+            // No subcommand provided → launch interactive REPL
+            if let Err(e) = run_interactive() {
+                eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
-            println!("Credential added for service: {}", service);
-        }
-        Commands::Get { service, vault_path, copy } => {
-            if let Err(e) = get_credential(&service, &vault_path, copy) {
-                eprintln!("Error getting credential: {}", e);
-                std::process::exit(1);
-            }
-        }
-        Commands::List { vault_path } => {
-            if let Err(e) = list_credentials(&vault_path) {
-                eprintln!("Error listing credentials: {}", e);
-                std::process::exit(1);
-            }
-        }
-        Commands::Delete { service, vault_path } => {
-            if let Err(e) = delete_credential(&service, &vault_path) {
-                eprintln!("Error deleting credential: {}", e);
-                std::process::exit(1);
-            }
-            println!("Credential deleted for service: {}", service);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Interactive REPL Mode
+// ---------------------------------------------------------------------------
+
+/// Holds the decrypted vault state and derived encryption key for an
+/// interactive session.
+struct VaultSession {
+    vault: Vault,
+    key: Vec<u8>,
+    vault_path: String,
+}
+
+impl Drop for VaultSession {
+    fn drop(&mut self) {
+        for byte in self.key.iter_mut() {
+            *byte = 0;
+        }
+    }
+}
+
+fn run_interactive() -> Result<(), anyhow::Error> {
+    let vault_path = "~/.local/share/rust-pass/vault.enc".to_string();
+    let expanded = expand_path(&vault_path);
+    let path = Path::new(&expanded);
+
+    if !path.exists() {
+        eprintln!("No vault found at {}. Run 'rust-pass init <master-password>' first.", vault_path);
+        return Ok(());
+    }
+
+    // Prompt for master password once
+    let mut master_password = prompt_password("Enter master password: ")?;
+    let salt = {
+        let vault_json = fs::read_to_string(path)?;
+        let vault: Vault = serde_json::from_str(&vault_json)?;
+        general_purpose::STANDARD.decode(&vault.master_key_hash)?
+    };
+    let key = derive_key(&master_password, &salt)?;
+
+    // Wipe the password string from memory
+    unsafe {
+        for byte in master_password.as_bytes_mut() {
+            *byte = 0;
+        }
+    }
+
+    let mut session = VaultSession {
+        vault: Vault { master_key_hash: general_purpose::STANDARD.encode(&salt), credentials: Vec::new() },
+        key,
+        vault_path: vault_path.clone(),
+    };
+
+    // Re-read vault into session (we need the actual credentials list)
+    let vault_json = fs::read_to_string(path)?;
+    session.vault = serde_json::from_str(&vault_json)?;
+
+    println!("Vault unlocked. {} service(s) stored.", session.vault.credentials.len());
+
+    loop {
+        let choice = dialoguer::Select::new()
+            .with_prompt("Select an action")
+            .items(&[
+                "🔓 Get password (with clipboard option)",
+                "➕ Add new entry",
+                "🎲 Generate new password for service",
+                "📋 List all services",
+                "❌ Lock & Exit",
+            ])
+            .default(0)
+            .interact()?;
+
+        match choice {
+            0 => match interactive_get(&mut session) {
+                Ok(()) => {}
+                Err(e) => eprintln!("Error: {}", e),
+            },
+            1 => match interactive_add(&mut session) {
+                Ok(()) => {}
+                Err(e) => eprintln!("Error: {}", e),
+            },
+            2 => match interactive_generate(&mut session) {
+                Ok(()) => {}
+                Err(e) => eprintln!("Error: {}", e),
+            },
+            3 => {
+                println!("\nStored services:");
+                for cred in &session.vault.credentials {
+                    println!("  - {}", cred.service);
+                }
+                println!();
+            }
+            4 => {
+                save_vault(&session)?;
+                println!("Vault locked. Goodbye!");
+                break;
+            }
+            _ => break,
+        }
+    }
+
+    Ok(())
+}
+
+fn prompt_password(prompt: &str) -> Result<String, anyhow::Error> {
+    use std::io::Write;
+    print!("{}", prompt);
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim().to_string())
+}
+
+fn interactive_get(session: &mut VaultSession) -> Result<(), anyhow::Error> {
+    let service = dialoguer::Input::<String>::new()
+        .with_prompt("Service name")
+        .interact_text()?;
+
+    let credential = session.vault.credentials.iter()
+        .find(|c| c.service == service)
+        .ok_or_else(|| anyhow::anyhow!("Service '{}' not found", service))?;
+
+    let decrypted = decrypt_password(&session.key, &credential.encrypted_password)?;
+
+    let copy: bool = dialoguer::Confirm::new()
+        .with_prompt("Copy to clipboard")
+        .default(true)
+        .interact()?;
+
+    if copy {
+        let mut clipboard = Clipboard::new()?;
+        clipboard.set_text(decrypted.clone())?;
+        println!("Password copied to clipboard");
+    } else {
+        println!("Password: {}", decrypted);
+    }
+
+    Ok(())
+}
+
+fn interactive_add(session: &mut VaultSession) -> Result<(), anyhow::Error> {
+    let service = dialoguer::Input::<String>::new()
+        .with_prompt("Service name")
+        .interact_text()?;
+
+    let username = dialoguer::Input::<String>::new()
+        .with_prompt("Username")
+        .interact_text()?;
+
+    if session.vault.credentials.iter().any(|c| c.service == service) {
+        return Err(anyhow::anyhow!("Service '{}' already exists", service));
+    }
+
+    let use_generated: bool = dialoguer::Confirm::new()
+        .with_prompt("Generate a secure password")
+        .default(true)
+        .interact()?;
+
+    let password_value = if use_generated {
+        let pw = generate_secure_password();
+        println!("Generated password: {}", pw);
+        pw
+    } else {
+        let pw = prompt_password("Enter password: ")?;
+        pw
+    };
+
+    let encrypted_password = encrypt_password(&session.key, &password_value)?;
+
+    session.vault.credentials.push(Credential {
+        service: service.clone(),
+        username,
+        encrypted_password,
+    });
+
+    save_vault(session)?;
+    println!("Credential saved for '{}'.", service);
+
+    Ok(())
+}
+
+fn interactive_generate(session: &mut VaultSession) -> Result<(), anyhow::Error> {
+    let service = dialoguer::Input::<String>::new()
+        .with_prompt("Service name")
+        .interact_text()?;
+
+    let credential = session.vault.credentials.iter_mut()
+        .find(|c| c.service == service)
+        .ok_or_else(|| anyhow::anyhow!("Service '{}' not found", service))?;
+
+    let new_password = generate_secure_password();
+    let encrypted = encrypt_password(&session.key, &new_password)?;
+    credential.encrypted_password = encrypted;
+
+    save_vault(session)?;
+    println!("New password generated and saved for '{}'.", service);
+
+    let copy: bool = dialoguer::Confirm::new()
+        .with_prompt("Copy to clipboard")
+        .default(true)
+        .interact()?;
+
+    if copy {
+        let mut clipboard = Clipboard::new()?;
+        clipboard.set_text(new_password.clone())?;
+        println!("New password copied to clipboard");
+    } else {
+        println!("New password: {}", new_password);
+    }
+
+    Ok(())
+}
+
+fn save_vault(session: &VaultSession) -> Result<(), anyhow::Error> {
+    let expanded = expand_path(&session.vault_path);
+    let path = Path::new(&expanded);
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let json = serde_json::to_string(&session.vault)?;
+    fs::write(path, json)?;
+    Ok(())
 }
 
 fn expand_path(path: &str) -> String {
