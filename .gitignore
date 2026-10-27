@@ -1,0 +1,26 @@
+# Rust build artifacts
+/target
+/*.rs.bak
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+
+# Environment / secrets
+.env
+*.env
+*.log
+.vault-pass
+
+# Local vault data (if committed by accident)
+*.enc
+
+# macOS metadata
+.metadata_never_index
+.Trashes
