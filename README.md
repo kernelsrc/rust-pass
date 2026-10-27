@@ -104,4 +104,4 @@ rust-pass/
 
 ## License
 
-MIT
+GPL-3.0-only
